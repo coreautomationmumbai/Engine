@@ -6,6 +6,7 @@ import time
 import hashlib
 import requests
 import feedparser
+from collections import Counter
 
 # --- CREDENTIALS & SECRETS ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -13,6 +14,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
+MIN_CONSENSUS_CONFIDENCE = 0.65  # Require 65%+ agreement across models
 
 # --- TARGET MICRO-TASK FEEDS ---
 FEEDS = {
@@ -23,6 +25,7 @@ FEEDS = {
 
 # --- ACTIVE FREE-TIER GEMINI MODELS (WITH INSTANT FALLBACK) ---
 MODEL_CANDIDATES = [
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-2.0-flash",
     "gemini-2.5-flash"
@@ -44,6 +47,48 @@ TECH_KEYWORDS = [
     r"\bcrawler\b", r"\bextract\b", r"\bcsv\b", r"\bparser\b", r"\btool\b",
     r"\bselenium\b", r"\bplaywright\b", r"\bsql\b"
 ]
+
+# --- AI TELLS & TRAPS DETECTION ---
+AI_TELLS = [
+    r"\bas an ai\b", r"\bas a large language model\b", r"\bi'm an ai\b",
+    r"\bi cannot\b", r"\bi don't have access\b", r"\bplease note\b",
+    r"\bhowever\b", r"\bit's important to mention\b", r"\bi should note\b",
+    r"\bfurthermore\b", r"\badditionally\b", r"\bi must inform\b",
+    r"\bi apologize\b", r"\bi'm unable\b", r"\bi don't have the ability\b",
+    r"\bfor your information\b", r"\bin conclusion\b", r"\btherefore\b"
+]
+
+AI_TRAPS = [
+    r"\byou should\b", r"\byou must\b", r"\byou need to\b",
+    r"\bplease ensure\b", r"\bensure that\b", r"\bmake sure\b",
+    r"\bit is recommended\b", r"\bit is advised\b", r"\best practice\b",
+    r"\bwarning:", r"\balert:", r"\bimportant:",
+    r"\bdisclaimer:", r"\blegal", r"\bliability\b"
+]
+
+def contains_ai_tells(text: str) -> bool:
+    """Detect common AI phrasing patterns."""
+    lower = text.lower()
+    return any(re.search(term, lower, re.IGNORECASE) for term in AI_TELLS)
+
+def contains_ai_traps(text: str) -> bool:
+    """Detect manipulative or advisory language that suggests AI origin."""
+    lower = text.lower()
+    return any(re.search(term, lower, re.IGNORECASE) for term in AI_TRAPS)
+
+def ai_authenticity_score(text: str) -> float:
+    """Score text authenticity (0.0-1.0). Higher = more likely human/authentic."""
+    if not text or len(text) < 20:
+        return 0.5
+    
+    tells_count = sum(1 for term in AI_TELLS if re.search(term, text.lower(), re.IGNORECASE))
+    traps_count = sum(1 for term in AI_TRAPS if re.search(term, text.lower(), re.IGNORECASE))
+    
+    # Deduct points for AI tells/traps
+    penalties = (tells_count * 0.15) + (traps_count * 0.10)
+    authenticity = max(0.0, 1.0 - penalties)
+    
+    return authenticity
 
 def is_employment(text: str) -> bool:
     lower = text.lower()
@@ -117,37 +162,87 @@ def sync_telegram_actions(state):
         print(f"[-] Telegram Sync: {e}")
     return state
 
-# --- ROBUST GEMINI CALL WITH AUTO-FALLBACK ---
-def query_gemini_api(prompt: str):
+# --- SINGLE MODEL QUERY WITH AI DETECTION ---
+def query_gemini_model(model: str, prompt: str) -> dict:
+    """Query a single Gemini model and return result with metadata."""
     if not GEMINI_API_KEY:
-        print("[-] GEMINI_API_KEY missing.")
-        return None
+        return {"success": False, "model": model, "error": "GEMINI_API_KEY missing"}
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2}
     }
 
-    for model in MODEL_CANDIDATES:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            res = requests.post(url, json=payload, timeout=30)
-            data = res.json()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    try:
+        res = requests.post(url, json=payload, timeout=30)
+        data = res.json()
+        
+        if res.status_code == 200:
+            candidates = data.get("candidates", [])
+            if candidates:
+                raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
+                
+                # Check for AI tells/traps
+                has_tells = contains_ai_tells(raw_text)
+                has_traps = contains_ai_traps(raw_text)
+                authenticity = ai_authenticity_score(raw_text)
+                
+                return {
+                    "success": True,
+                    "model": model,
+                    "raw_text": raw_text,
+                    "has_ai_tells": has_tells,
+                    "has_ai_traps": has_traps,
+                    "authenticity": authenticity,
+                    "error": None
+                }
+        elif res.status_code == 404:
+            return {"success": False, "model": model, "error": f"Model {model} not available (404)"}
+        else:
+            error_msg = data.get('error', {}).get('message', res.text)
+            return {"success": False, "model": model, "error": error_msg}
             
-            if res.status_code == 200:
-                candidates = data.get("candidates", [])
-                if candidates:
-                    return candidates[0]["content"]["parts"][0]["text"].strip()
-            elif res.status_code == 404:
-                # Model not available in this tier/version, continue to next
-                continue
-            else:
-                print(f"[-] Gemini API [{model}] Error: {data.get('error', {}).get('message', res.text)}")
-        except Exception as e:
-            print(f"[-] Request failed for model {model}: {e}")
-            continue
+    except Exception as e:
+        return {"success": False, "model": model, "error": str(e)}
 
-    return None
+# --- MODEL ENSEMBLE WITH CONSENSUS ---
+def query_gemini_ensemble(prompt: str) -> str:
+    """Query multiple models and use consensus-based filtering."""
+    results = []
+    successful_results = []
+    
+    print("[*] Querying model ensemble...")
+    
+    for model in MODEL_CANDIDATES:
+        result = query_gemini_model(model, prompt)
+        results.append(result)
+        
+        if result["success"]:
+            successful_results.append(result)
+            print(f"  ✓ {model}: Success (Authenticity: {result['authenticity']:.2f})")
+        else:
+            print(f"  ✗ {model}: {result['error']}")
+        
+        time.sleep(0.3)  # Brief delay between API calls
+    
+    if not successful_results:
+        print("[-] No successful model responses.")
+        return None
+    
+    # Filter out responses with AI tells/traps
+    authentic_results = [r for r in successful_results if r["authenticity"] > 0.5]
+    
+    if not authentic_results:
+        print("[-] All responses flagged as containing AI tells/traps. Rejecting ensemble.")
+        return None
+    
+    # Use highest authenticity score response as primary
+    best_result = max(authentic_results, key=lambda x: x["authenticity"])
+    
+    print(f"[+] Selected model: {best_result['model']} (Authenticity: {best_result['authenticity']:.2f})")
+    
+    return best_result["raw_text"]
 
 # --- PROCESS MICRO-TASK (<$100) ---
 def process_freelance_project(title: str, description: str):
@@ -184,7 +279,7 @@ def process_freelance_project(title: str, description: str):
     }}
     """
 
-    raw_text = query_gemini_api(prompt)
+    raw_text = query_gemini_ensemble(prompt)
     if not raw_text:
         return None
 
