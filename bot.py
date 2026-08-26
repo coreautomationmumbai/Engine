@@ -14,13 +14,8 @@ MIN_TASK_SCORE = 65
 
 # --- NON-REDDIT FREELANCE PROJECT & BOUNTY FEEDS ---
 FEEDS = {
-    # Live Freelancer.com Project Feed (Scrapers, scripts, bots, fixes)
     "Freelancer.com Live Projects": "https://www.freelancer.com/rss.xml",
-
-    # Web3 & Tech One-Off Contracts / Bounties
     "CryptoJobs Freelance Bounties": "https://cryptojobslist.com/rss/freelance",
-    
-    # Contract & Discrete Task Feeds
     "WWR Contract Only": "https://weworkremotely.com/categories/remote-contract-jobs.rss",
     "Nodes Contract Stream": "https://nodes.com/jobs/rss",
     "Remotive Dev Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
@@ -35,6 +30,115 @@ def sanitize_payload(text: str) -> str:
     cleaned = re.sub(r'(?i)(author|developer|user|created by):\s*.*', '', cleaned)
     cleaned = re.sub(r'(/home/|/Users/|[A-Za-z]:\\Users\\)[a-zA-Z0-9_-]+', '/app', cleaned)
     cleaned = re.sub(r'\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1]))\.\d{1,3}\.\d{1,3}\b', '0.0.0.0', cleaned)
+    return cleaned.strip()
+
+# --- CACHE MANAGEMENT ---
+def load_cache():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_cache(seen_set):
+    with open(DB_FILE, "w") as f:
+        json.dump(list(seen_set)[-1000:], f, indent=2)
+
+# --- GEMINI INFERENCE CALL ---
+def call_gemini(system_prompt: str, user_prompt: str, temperature: float = 0.2):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": f"SYSTEM: {system_prompt}\n\nINPUT: {user_prompt}"}]}
+        ],
+        "generationConfig": {"temperature": temperature}
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=40)
+        return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+    except Exception as e:
+        print(f"Gemini API Exception: {e}")
+        return None
+
+# --- MULTI-STAGE TASK EVALUATOR & SCRIPT BUILDER ---
+def process_freelance_project(title: str, description: str):
+    clean_desc = re.sub(r'<[^>]+>', ' ', description)
+    clean_desc = re.sub(r'\s+', ' ', clean_desc)[:3500]
+
+    evaluator_system = """
+    You are an automated freelance contract screener.
+    Filter strictly for discrete, 1-off technical tasks (e.g. scrapers, scripts, bots, data cleaning, API glue, bug fixes).
+
+    STRICT RULES:
+    1. REJECT (fit_score: 0) any full-time salaried jobs, long-term employment, or posts requiring resumes/interviews.
+    2. ACCEPT (fit_score: 70-100) only standalone programming tasks with clear, deliverable requirements.
+
+    Return ONLY raw JSON (no markdown formatting, no ```json):
+    {
+        "fit_score": <int 0-100>,
+        "is_single_task": <true/false>,
+        "task_summary": "<Short 5-8 deliverable of summary word>",
+        "recommended_bid": "<Estimated $150, $350 $50, e.g. flat-rate price,>",
+        "turnaround": "<e.g. 24 Hours>"
+    }
+    """
+    raw_eval = call_gemini(evaluator_system, f"Title: {title}\nDetails: {clean_desc}", temperature=0.1)
+    if not raw_eval:
+        return None
+
+    try:
+        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", raw_eval.strip())
+        clean_json = re.sub(r"\n?```$", "", clean_json.strip())
+        eval_data = json.loads(clean_json)
+    except Exception:
+        return None
+
+    if eval_data.get("fit_score", 0) < MIN_TASK_SCORE or not eval_data.get("is_single_task", False):
+        return None
+
+    builder_system = """
+    You are a Principal Software Consultant.
+    Write:
+    1. A human, confident 2-3 sentence pitch tailored to this project (zero generic AI words like 'thrilled', 'delve', 'testament').
+    2. A production-ready Python solution script handling the task with clean error handling and type annotations.
+
+    Return ONLY raw JSON:
+    {
+        "custom_proposal": "<2-3 sentence direct proposal with flat turnaround commitment>",
+        "python_solution": "<Executable Python code prototype>"
+    }
+    """
+    raw_build = call_gemini(builder_system, f"Task: {eval_data['task_summary']}\nDetails: {clean_desc}", temperature=0.2)
+    if not raw_build:
+        return None
+
+    try:
+        clean_build = re.sub(r"^```[a-zA-Z]*\n?", "", raw_build.strip())
+        clean_build = re.sub(r"\n?```$", "", clean_build.strip())
+        build_data = json.loads(clean_build)
+    except Exception:
+        return None
+
+    return {
+        "score": eval_data.get("fit_score", 0),
+        "task": eval_data.get("task_summary", "Custom Python Script"),
+        "bid": eval_data.get("recommended_bid", "Fixed Quote"),
+        "turnaround": eval_data.get("turnaround", "24h"),
+        "proposal": build_data.get("custom_proposal", ""),
+        "code": sanitize_payload(build_data.get("python_solution", ""))
+    }
+
+# --- TELEGRAM DISPATCH ---
+def dispatch_task_alert(source, title, link, package):
+    card = (
+        f"⚡ <b>FREELANCE TASK [{package['score']}/100]</b>\n"
+        f"🌐 <b>Platform:</b> {html.escape(source)}\n"
+        f"📌 <b>Project:</b> {html.escape(title)}\n"
+        f"🎯 <b>Deliverable:</b> <code>{html.escape(package['task'])}</code>\n\n"
+        f"💰 <b>Recommended Quote:</b> {html.escape(package['bid'])}\n"
+        f"⏱    cleaned = re.sub(r'\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1]))\.\d{1,3}\.\d{1,3}\b', '0.0.0.0', cleaned)
     return cleaned.strip()
 
 # --- CACHE MANAGEMENT ---
