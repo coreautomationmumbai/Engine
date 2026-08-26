@@ -2,13 +2,14 @@ import os
 import json
 import html
 import re
+import time
 import requests
 import feedparser
 
 # --- ENVIRONMENT CREDENTIALS ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_FILE = "seen_jobs.json"
 MIN_TASK_SCORE = 65
 
@@ -25,15 +26,10 @@ FEEDS = {
 def sanitize_payload(text: str) -> str:
     if not text:
         return ""
-    # Strip markdown code blocks
     cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", text.strip())
     cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-    
-    # Strip author identifiers and user system paths safely
     cleaned = re.sub(r"(?i)(author|developer|user|created by):\s*.*", "", cleaned)
     cleaned = re.sub(r"(/home/|/Users/|[A-Za-z]:\\Users\\)[a-zA-Z0-9_-]+", "/app", cleaned)
-    
-    # Standardize local IPs to placeholder
     cleaned = re.sub(r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|127\.0\.0\.1", "0.0.0.0", cleaned)
     return cleaned.strip()
 
@@ -51,20 +47,44 @@ def save_cache(seen_set):
     with open(DB_FILE, "w") as f:
         json.dump(list(seen_set)[-1000:], f, indent=2)
 
-# --- GEMINI INFERENCE CALL ---
+# --- GEMINI INFERENCE CALL WITH ERROR LOGGING ---
 def call_gemini(system_prompt: str, user_prompt: str, temperature: float = 0.2):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + str(GEMINI_API_KEY)
+    if not GEMINI_API_KEY:
+        print("Error: GEMINI_API_KEY is not set or empty in GitHub Secrets.")
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [
-            {"role": "user", "parts": [{"text": f"SYSTEM: {system_prompt}\n\nINPUT: {user_prompt}"}]}
+            {
+                "parts": [
+                    {"text": f"{system_prompt}\n\n{user_prompt}"}
+                ]
+            }
         ],
-        "generationConfig": {"temperature": temperature}
+        "generationConfig": {
+            "temperature": temperature
+        }
     }
+
     try:
-        res = requests.post(url, json=payload, timeout=40)
-        return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        res = requests.post(url, json=payload, timeout=30)
+        data = res.json()
+
+        if res.status_code != 200:
+            error_msg = data.get("error", {}).get("message", res.text)
+            print(f"Gemini API Error [{res.status_code}]: {error_msg}")
+            return None
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print(f"Gemini API Notice: No candidates returned (feedback: {data.get('promptFeedback', {})})")
+            return None
+
+        return candidates[0]["content"]["parts"][0]["text"].strip()
+
     except Exception as e:
-        print(f"Gemini API Exception: {e}")
+        print(f"Gemini Request Exception: {e}")
         return None
 
 # --- MULTI-STAGE TASK EVALUATOR & SCRIPT BUILDER ---
@@ -79,7 +99,7 @@ STRICT RULES:
 1. REJECT (fit_score: 0) any full-time salaried jobs, long-term employment, or posts requiring resumes/interviews.
 2. ACCEPT (fit_score: 70-100) only standalone programming tasks with clear, deliverable requirements.
 
-Return ONLY raw JSON (no markdown formatting, no backticks):
+Return ONLY raw JSON (no markdown, no code block backticks):
 {
     "fit_score": 85,
     "is_single_task": true,
@@ -158,7 +178,7 @@ def dispatch_task_alert(source, title, link, package):
         }
     }, timeout=10)
 
-    if package["code"]:
+    if package.get("code"):
         code_card = f"🛠 <b>Solution Prototype:</b>\n<pre><code class='language-python'>{html.escape(package['code'][:3800])}</code></pre>"
         requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -188,6 +208,7 @@ def main():
                     if package:
                         dispatch_task_alert(source_name, title, link, package)
                         count += 1
+                    time.sleep(0.5)  # Rate limiting courtesy delay
         except Exception as e:
             print(f"Error checking {source_name}: {e}")
 
