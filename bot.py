@@ -12,7 +12,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 STATE_FILE = "jobs_state.json"
-MIN_TASK_SCORE = 55
+MIN_TASK_SCORE = 50
 
 # --- TARGET FEEDS ---
 FEEDS = {
@@ -22,28 +22,17 @@ FEEDS = {
     "Remotive Tech Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
 }
 
-# --- PRE-FILTER: STRICT EMPLOYMENT REJECTION LIST ---
+# --- PRE-FILTER REGEX (INSTANT ZERO-LATENCY SKIPS) ---
 EMPLOYMENT_TERMS = [
     r"\bfull[\s-]?time\b", r"\bpart[\s-]?time\b", r"\bsalary\b", r"\bannual\b",
-    r"\bper annum\b", r"\bbenefits\b", r"\b401k\b", r"\bw2\b", r"\bhealth insurance\b",
-    r"\bjoin our team\b", r"\bpermanent\b", r"\bhourly rate ongoing\b",
+    r"\bper annum\b", r"\bbenefits\b", r"\b401k\b", r"\bw2\b", r"\bpermanent\b",
     r"\bmonthly retainer\b", r"\bequity\b", r"\bstaff engineer\b", r"\bsenior role\b",
     r"\binterview process\b", r"\bsend resume\b", r"\bsend cv\b"
-]
-
-TASK_ACCEPT_TERMS = [
-    r"\bpython\b", r"\bscript\b", r"\bscrape\b", r"\bscraper\b", r"\bscraping\b",
-    r"\bbot\b", r"\bautomation\b", r"\bapi\b", r"\bwebhook\b", r"\bfix\b",
-    r"\bcrawler\b", r"\bextract\b", r"\bcsv\b", r"\bparser\b", r"\btool\b"
 ]
 
 def is_strict_employment(text: str) -> bool:
     lower = text.lower()
     return any(re.search(term, lower) for term in EMPLOYMENT_TERMS)
-
-def contains_task_keywords(text: str) -> bool:
-    lower = text.lower()
-    return any(re.search(term, lower) for term in TASK_ACCEPT_TERMS)
 
 def get_stable_id(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
@@ -79,7 +68,7 @@ def save_state(state):
 def sync_telegram_actions(state):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
-        res = requests.get(url, timeout=10).json()
+        res = requests.get(url, timeout=5).json()
         if res.get("ok"):
             for update in res.get("result", []):
                 if "callback_query" in update:
@@ -93,7 +82,8 @@ def sync_telegram_actions(state):
                             state[job_key]["status"] = "SUBMITTED"
                             requests.post(
                                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "✅ Marked as SUBMITTED!"}
+                                json={"callback_query_id": cb_id, "text": "✅ Marked as SUBMITTED!"},
+                                timeout=5
                             )
                     elif data.startswith("skip_"):
                         job_key = data.replace("skip_", "")
@@ -101,171 +91,92 @@ def sync_telegram_actions(state):
                             state[job_key]["status"] = "SKIPPED"
                             requests.post(
                                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "❌ Marked as SKIPPED."}
+                                json={"callback_query_id": cb_id, "text": "❌ Marked as SKIPPED."},
+                                timeout=5
                             )
     except Exception as e:
-        print(f"[-] Telegram Sync Notice: {e}")
+        print(f"[-] Telegram Sync: {e}")
     return state
 
-# --- GEMINI 3.7 FLASH EXTENDED CALL ---
-def call_gemini(system_prompt: str, user_prompt: str, thinking_budget: int = 2048):
-    if not GEMINI_API_KEY:
-        print("[-] Missing GEMINI_API_KEY.")
+# --- UNIFIED SINGLE-PASS GEMINI 3.7 THINKING INFERENCE ---
+def process_freelance_project(title: str, description: str):
+    full_text = f"{title} {description}"
+    if is_strict_employment(full_text):
+        print(f"[*] Pre-Filter Dropped (Employment terms): '{title[:35]}'")
         return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key={GEMINI_API_KEY}"
+    clean_desc = re.sub(r"<[^>]+>", " ", description)
+    clean_desc = re.sub(r"\s+", " ", clean_desc)[:2500]
+
+    prompt = f"""
+    Analyze this freelance project listing as an Elite Technical Consultant & Python Engineer.
     
+    Listing Title: {title}
+    Listing Details: {clean_desc}
+
+    Perform the following internal steps:
+    1. Filter: Check if this is a discrete 1-off technical task (scraper, bot, script, API bridge, data cleaning, automation). Reject full-time jobs or non-technical requests.
+    2. Proposal: Write a concise, confident 2-3 sentence human pitch with a fixed-rate flat quote and a 24-48h turnaround commitment (no AI cliches like 'delve', 'thrilled', 'testament').
+    3. Code: Write a production-ready, complete Python solution prototype with type annotations and clean exception handling.
+
+    Return ONLY a single valid JSON object (no markdown wrappers, no backticks):
+    {{
+        "fit_score": <int 0-100>,
+        "is_one_off": <true/false>,
+        "task_name": "<Short 5-word deliverable name>",
+        "suggested_bid": "<e.g. $150 - $350 Flat Rate>",
+        "turnaround": "24-48 Hours",
+        "pitch": "<2-3 sentence proposal>",
+        "code": "<Complete executable Python code>"
+    }}
+    """
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": f"SYSTEM INSTRUCTION: {system_prompt}\n\nUSER PROMPT: {user_prompt}"}]
-            }
-        ],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "thinkingConfig": {
-                "thinkingBudget": thinking_budget
-            }
+            "thinkingConfig": {"thinkingBudget": 1024}
         }
     }
 
     try:
-        res = requests.post(url, json=payload, timeout=60)
+        res = requests.post(url, json=payload, timeout=25)
         data = res.json()
-
-        if res.status_code != 200:
-            print(f"[-] API Error [{res.status_code}]: {data.get('error', {}).get('message', res.text)}")
-            return None
-
         candidates = data.get("candidates", [])
         if not candidates:
             return None
 
         parts = candidates[0].get("content", {}).get("parts", [])
+        raw_text = ""
         for part in parts:
             if "text" in part and not part.get("thought", False):
-                return part["text"].strip()
+                raw_text = part["text"].strip()
+                break
 
-        return parts[0]["text"].strip() if parts else None
-    except Exception as e:
-        print(f"[-] Gemini Exception: {e}")
-        return None
+        if not raw_text and parts:
+            raw_text = parts[0].get("text", "").strip()
 
-# --- 3-AGENT REASONING (ONE-OFF STRICT ENFORCEMENT) ---
-def process_freelance_project(title: str, description: str):
-    full_text = f"{title} {description}"
-    
-    # 1. Fast regex rejection of employment posts
-    if is_strict_employment(full_text):
-        print(f"[*] Pre-Filter Dropped (Employment terms detected): '{title[:40]}'")
-        return None
-
-    clean_desc = re.sub(r"<[^>]+>", " ", description)
-    clean_desc = re.sub(r"\s+", " ", clean_desc)[:3500]
-
-    # --- AGENT 1: STRICT ONE-OFF TRIAGE ---
-    screener_sys = """You are a Strict Micro-Contract Screener.
-Your ONLY goal is to accept standalone, 1-off discrete technical tasks (scripts, scrapers, bots, API bridges, bug fixes).
-
-MANDATORY REJECTION CRITERIA:
-- REJECT (fit_score: 0, is_one_off: false) if this is a salaried job, full-time/part-time employment, requires daily standups/meetings, or asks for resumes.
-- ACCEPT (fit_score: 70-100, is_one_off: true) ONLY if it is a single deliverable with an immediate flat-rate turnaround.
-"""
-    screener_usr = f"""
-    Title: {title}
-    Details: {clean_desc}
-
-    Return ONLY raw JSON (no markdown formatting, no code fences):
-    {{
-        "fit_score": <int 0-100>,
-        "is_one_off": <true/false>,
-        "task_summary": "<Short 5-word summary of the standalone deliverable>"
-    }}
-    """
-    res1 = call_gemini(screener_sys, screener_usr, thinking_budget=1024)
-    if not res1:
-        return None
-
-    try:
-        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", res1.strip())
+        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text.strip())
         clean_json = re.sub(r"\n?```$", "", clean_json.strip())
         match = re.search(r"\{.*\}", clean_json, re.DOTALL)
-        data1 = json.loads(match.group(0)) if match else json.loads(clean_json)
-    except Exception:
+        result = json.loads(match.group(0)) if match else json.loads(clean_json)
+
+        if result.get("fit_score", 0) < MIN_TASK_SCORE or not result.get("is_one_off", False):
+            print(f"[*] Rejected: '{title[:35]}...' (Score: {result.get('fit_score')}, OneOff: {result.get('is_one_off')})")
+            return None
+
+        return {
+            "score": result.get("fit_score", 0),
+            "task": result.get("task_name", title[:30]),
+            "bid": result.get("suggested_bid", "Flat Quote"),
+            "turnaround": result.get("turnaround", "24-48 Hours"),
+            "pitch": result.get("pitch", ""),
+            "code": sanitize_payload(result.get("code", ""))
+        }
+    except Exception as e:
+        print(f"[-] Processing Error for '{title[:30]}': {e}")
         return None
-
-    if data1.get("fit_score", 0) < MIN_TASK_SCORE or not data1.get("is_one_off", False):
-        print(f"[*] Agent 1 Rejected: '{title[:35]}...' (Score: {data1.get('fit_score')}, OneOff: {data1.get('is_one_off')})")
-        return None
-
-    # --- AGENT 2: PRINCIPAL DEVELOPER (SOLVER & PITCH) ---
-    builder_sys = "You are a Senior Python Developer. Create a concise, human flat-rate pitch and an executable standalone Python prototype."
-    builder_usr = f"""
-    Task: {data1.get('task_summary', title)}
-    Context: {clean_desc}
-
-    Requirements:
-    1. Write a 2-3 sentence confident, human pitch with a fixed flat-rate quote and 24-48h turnaround commitment (no AI cliches like 'delve', 'thrilled', 'testament').
-    2. Write a production-ready, complete Python solution handling the task with clean error handling and type annotations.
-
-    Return ONLY raw JSON:
-    {{
-        "pitch": "<2-3 sentence human proposal>",
-        "code": "<Complete runnable Python code>",
-        "suggested_bid": "<e.g. $150 - $350 Flat Rate>"
-    }}
-    """
-    res2 = call_gemini(builder_sys, builder_usr, thinking_budget=2048)
-    if not res2:
-        return None
-
-    try:
-        clean_json2 = re.sub(r"^```[a-zA-Z]*\n?", "", res2.strip())
-        clean_json2 = re.sub(r"\n?```$", "", clean_json2.strip())
-        match2 = re.search(r"\{.*\}", clean_json2, re.DOTALL)
-        data2 = json.loads(match2.group(0)) if match2 else json.loads(clean_json2)
-    except Exception:
-        return None
-
-    # --- AGENT 3: QA AUDITOR & EXECUTIVE VERIFIER ---
-    auditor_sys = "You are a Principal QA and Security Reviewer. Audit the proposal and Python solution for bugs, missing imports, or corporate/AI jargon."
-    auditor_usr = f"""
-    Task: {data1.get('task_summary')}
-    Pitch Draft: {data2.get('pitch')}
-    Code Draft: {data2.get('code')}
-
-    Fix any missing imports, edge cases, and eliminate any synthetic AI words.
-    Return ONLY raw JSON:
-    {{
-        "final_pitch": "<Polished proposal>",
-        "verified_code": "<Audited Python code>"
-    }}
-    """
-    res3 = call_gemini(auditor_sys, auditor_usr, thinking_budget=1024)
-    if not res3:
-        final_pitch = data2.get("pitch", "")
-        verified_code = data2.get("code", "")
-    else:
-        try:
-            clean_json3 = re.sub(r"^```[a-zA-Z]*\n?", "", res3.strip())
-            clean_json3 = re.sub(r"\n?```$", "", clean_json3.strip())
-            match3 = re.search(r"\{.*\}", clean_json3, re.DOTALL)
-            data3 = json.loads(match3.group(0)) if match3 else json.loads(clean_json3)
-            final_pitch = data3.get("final_pitch", data2.get("pitch", ""))
-            verified_code = data3.get("verified_code", data2.get("code", ""))
-        except Exception:
-            final_pitch = data2.get("pitch", "")
-            verified_code = data2.get("code", "")
-
-    return {
-        "score": data1.get("fit_score", 0),
-        "task": data1.get("task_summary", title[:30]),
-        "bid": data2.get("suggested_bid", "Flat Quote"),
-        "turnaround": "24-48 Hours",
-        "pitch": final_pitch,
-        "code": sanitize_payload(verified_code)
-    }
 
 # --- TELEGRAM DISPATCH ---
 def dispatch_task_alert(source, title, link, package, short_id):
@@ -312,15 +223,16 @@ def main():
     state = sync_telegram_actions(state)
 
     dispatched = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TaskEngine/9.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TaskEngine/10.0"}
 
     for source_name, feed_url in FEEDS.items():
         try:
-            req = requests.get(feed_url, headers=headers, timeout=15)
+            req = requests.get(feed_url, headers=headers, timeout=10)
             feed = feedparser.parse(req.content)
             print(f"\n[+] Scanning {source_name}: {len(feed.entries)} listings found.")
 
-            for entry in feed.entries[:8]:
+            # Scan top 4 most recent listings to ensure fast execution
+            for entry in feed.entries[:4]:
                 task_id = getattr(entry, "id", entry.link)
                 short_id = get_stable_id(task_id)
 
@@ -329,7 +241,7 @@ def main():
                     link = entry.link
                     desc = getattr(entry, "summary", title)
 
-                    print(f" -> Evaluating: {title[:45]}...")
+                    print(f" -> Evaluating: {title[:40]}...")
                     package = process_freelance_project(title, desc)
                     if package:
                         state[short_id] = {
@@ -341,8 +253,8 @@ def main():
                         }
                         dispatch_task_alert(source_name, title, link, package, short_id)
                         dispatched += 1
-                        print(f" [✓] DISPATCHED ONE-OFF TASK: {title[:35]}")
-                        time.sleep(1)
+                        print(f" [✓] DISPATCHED: {title[:30]}")
+                        time.sleep(0.5)
 
         except Exception as e:
             print(f"[-] Error on {source_name}: {e}")
