@@ -13,6 +13,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
+RETENTION_SECONDS = 86400  # Auto-wipe entries older than 24 hours
 
 # --- TARGET MICRO-TASK FEEDS ---
 FEEDS = {
@@ -21,7 +22,7 @@ FEEDS = {
     "Remotive Tech Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
 }
 
-# --- VERIFIED ACTIVE MODEL HIERARCHY ---
+# --- ACTIVE GEMINI MODELS ---
 MODEL_CANDIDATES = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
@@ -57,7 +58,7 @@ def is_tech_task(text: str) -> bool:
 def get_stable_id(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
-# --- SAFE JSON PARSER (HANDLES UNESCAPED CONTROL CHARACTERS) ---
+# --- SAFE JSON PARSER ---
 def parse_json_safely(raw_str: str):
     if not raw_str:
         return None
@@ -89,7 +90,7 @@ def sanitize_payload(text: str) -> str:
     cleaned = re.sub(r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|127\.0\.0\.1", "0.0.0.0", cleaned)
     return cleaned.strip()
 
-# --- STATE STORAGE ---
+# --- STATE MANAGEMENT WITH 24-HOUR AUTO-PURGE ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -102,11 +103,16 @@ def load_state():
     return {}
 
 def save_state(state):
-    trimmed = dict(list(state.items())[-500:])
+    now = time.time()
+    # Auto-purge anything older than 24 hours to keep the state file lightweight
+    cleaned_state = {
+        k: v for k, v in state.items()
+        if now - v.get("created_at", now) < RETENTION_SECONDS
+    }
     with open(STATE_FILE, "w") as f:
-        json.dump(trimmed, f, indent=2)
+        json.dump(cleaned_state, f, indent=2)
 
-# --- TELEGRAM BUTTON SYNC ---
+# --- TELEGRAM ACTIONS (AUTO-DELETES DISCARDED CARDS) ---
 def sync_telegram_actions(state):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
@@ -117,6 +123,9 @@ def sync_telegram_actions(state):
                     cb = update["callback_query"]
                     data = cb.get("data", "")
                     cb_id = cb.get("id")
+                    message = cb.get("message", {})
+                    msg_id = message.get("message_id")
+                    chat_id = message.get("chat", {}).get("id")
 
                     if data.startswith("sub_"):
                         job_key = data.replace("sub_", "")
@@ -127,20 +136,40 @@ def sync_telegram_actions(state):
                                 json={"callback_query_id": cb_id, "text": "✅ Marked as SUBMITTED!"},
                                 timeout=5
                             )
+                            # Update message to show submitted state
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+                                json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "reply_markup": {"inline_keyboard": [[{"text": "✅ SUBMITTED", "callback_data": "done"}]]}
+                                },
+                                timeout=5
+                            )
+
                     elif data.startswith("skip_"):
                         job_key = data.replace("skip_", "")
                         if job_key in state:
                             state[job_key]["status"] = "SKIPPED"
+                            # Strip heavy prompt/code payload to save memory
+                            state[job_key].pop("package", None)
+
                             requests.post(
                                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                                json={"callback_query_id": cb_id, "text": "❌ Marked as SKIPPED."},
+                                json={"callback_query_id": cb_id, "text": "🗑️ Task discarded and deleted!"},
+                                timeout=5
+                            )
+                            # Auto-delete the message card from your Telegram chat
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+                                json={"chat_id": chat_id, "message_id": msg_id},
                                 timeout=5
                             )
     except Exception as e:
         print(f"[-] Telegram Sync Notice: {e}")
     return state
 
-# --- GEMINI INFERENCE CALL WITH RETRY & FAILOVER ---
+# --- GEMINI INFERENCE ENGINE ---
 def query_gemini_api(prompt: str):
     if not GEMINI_API_KEY:
         print("[-] GEMINI_API_KEY missing.")
@@ -154,7 +183,6 @@ def query_gemini_api(prompt: str):
     for model in MODEL_CANDIDATES:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         
-        # Try up to 2 times per model if high demand (503/429) occurs
         for attempt in range(2):
             try:
                 res = requests.post(url, json=payload, timeout=50)
@@ -171,19 +199,13 @@ def query_gemini_api(prompt: str):
                             return parts[0].get("text", "").strip()
 
                 elif res.status_code in [429, 503]:
-                    print(f"[*] {model} high demand ({res.status_code}), waiting 2s...")
                     time.sleep(2)
                     continue
                 elif res.status_code == 404:
-                    break  # Endpoint not found, skip immediately to next model candidate
-                else:
-                    print(f"[-] {model} Error [{res.status_code}]: {data.get('error', {}).get('message', res.text)}")
                     break
-            except requests.exceptions.Timeout:
-                print(f"[*] {model} request timed out (50s limit). Trying next candidate...")
-                break
-            except Exception as e:
-                print(f"[-] Request failed for {model}: {e}")
+                else:
+                    break
+            except Exception:
                 break
 
     return None
@@ -201,7 +223,7 @@ def process_freelance_project(title: str, description: str):
     clean_desc = re.sub(r"\s+", " ", clean_desc)[:2500]
 
     prompt = f"""
-    You are a direct, experienced freelance Python engineer applying to a small technical task.
+    You are a direct, experienced freelance Python engineer applying to a small task.
     
     CRITICAL TONE RULES FOR PITCH (ANTI-AI DETECTION):
     - NO greetings like "Dear Hiring Manager", "Hello client", or "I hope this finds you well".
@@ -296,7 +318,7 @@ def main():
     state = sync_telegram_actions(state)
 
     dispatched = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/17.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/18.0"}
 
     for source_name, feed_url in FEEDS.items():
         try:
