@@ -6,7 +6,6 @@ import time
 import hashlib
 import requests
 import feedparser
-from collections import Counter
 
 # --- CREDENTIALS & SECRETS ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -14,7 +13,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
-MIN_CONSENSUS_CONFIDENCE = 0.65  # Require 65%+ agreement across models
 
 # --- TARGET MICRO-TASK FEEDS ---
 FEEDS = {
@@ -23,12 +21,12 @@ FEEDS = {
     "Remotive Tech Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
 }
 
-# --- ACTIVE FREE-TIER GEMINI MODELS (WITH INSTANT FALLBACK) ---
+# --- VERIFIED ACTIVE MODEL HIERARCHY ---
 MODEL_CANDIDATES = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash"
+    "gemini-1.5-flash",
+    "gemini-1.5-pro"
 ]
 
 # --- PRE-FILTER: REJECT EMPLOYMENT OR LARGE PROJECTS ---
@@ -48,48 +46,6 @@ TECH_KEYWORDS = [
     r"\bselenium\b", r"\bplaywright\b", r"\bsql\b"
 ]
 
-# --- AI TELLS & TRAPS DETECTION ---
-AI_TELLS = [
-    r"\bas an ai\b", r"\bas a large language model\b", r"\bi'm an ai\b",
-    r"\bi cannot\b", r"\bi don't have access\b", r"\bplease note\b",
-    r"\bhowever\b", r"\bit's important to mention\b", r"\bi should note\b",
-    r"\bfurthermore\b", r"\badditionally\b", r"\bi must inform\b",
-    r"\bi apologize\b", r"\bi'm unable\b", r"\bi don't have the ability\b",
-    r"\bfor your information\b", r"\bin conclusion\b", r"\btherefore\b"
-]
-
-AI_TRAPS = [
-    r"\byou should\b", r"\byou must\b", r"\byou need to\b",
-    r"\bplease ensure\b", r"\bensure that\b", r"\bmake sure\b",
-    r"\bit is recommended\b", r"\bit is advised\b", r"\best practice\b",
-    r"\bwarning:", r"\balert:", r"\bimportant:",
-    r"\bdisclaimer:", r"\blegal", r"\bliability\b"
-]
-
-def contains_ai_tells(text: str) -> bool:
-    """Detect common AI phrasing patterns."""
-    lower = text.lower()
-    return any(re.search(term, lower, re.IGNORECASE) for term in AI_TELLS)
-
-def contains_ai_traps(text: str) -> bool:
-    """Detect manipulative or advisory language that suggests AI origin."""
-    lower = text.lower()
-    return any(re.search(term, lower, re.IGNORECASE) for term in AI_TRAPS)
-
-def ai_authenticity_score(text: str) -> float:
-    """Score text authenticity (0.0-1.0). Higher = more likely human/authentic."""
-    if not text or len(text) < 20:
-        return 0.5
-    
-    tells_count = sum(1 for term in AI_TELLS if re.search(term, text.lower(), re.IGNORECASE))
-    traps_count = sum(1 for term in AI_TRAPS if re.search(term, text.lower(), re.IGNORECASE))
-    
-    # Deduct points for AI tells/traps
-    penalties = (tells_count * 0.15) + (traps_count * 0.10)
-    authenticity = max(0.0, 1.0 - penalties)
-    
-    return authenticity
-
 def is_employment(text: str) -> bool:
     lower = text.lower()
     return any(re.search(term, lower) for term in EMPLOYMENT_TERMS)
@@ -101,6 +57,28 @@ def is_tech_task(text: str) -> bool:
 def get_stable_id(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
+# --- SAFE JSON PARSER (HANDLES UNESCAPED CONTROL CHARACTERS) ---
+def parse_json_safely(raw_str: str):
+    if not raw_str:
+        return None
+    clean_str = re.sub(r"^```[a-zA-Z]*\n?", "", raw_str.strip())
+    clean_str = re.sub(r"\n?```$", "", clean_str.strip())
+    
+    match = re.search(r"\{.*\}", clean_str, re.DOTALL)
+    if match:
+        clean_str = match.group(0)
+
+    try:
+        return json.loads(clean_str, strict=False)
+    except Exception:
+        pass
+
+    try:
+        sanitized = re.sub(r'[\r\n\t]', lambda m: '\\n' if m.group(0) in '\r\n' else '\\t', clean_str)
+        return json.loads(sanitized, strict=False)
+    except Exception:
+        return None
+
 def sanitize_payload(text: str) -> str:
     if not text:
         return ""
@@ -111,7 +89,7 @@ def sanitize_payload(text: str) -> str:
     cleaned = re.sub(r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|127\.0\.0\.1", "0.0.0.0", cleaned)
     return cleaned.strip()
 
-# --- STATE MANAGEMENT ---
+# --- STATE STORAGE ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -159,93 +137,61 @@ def sync_telegram_actions(state):
                                 timeout=5
                             )
     except Exception as e:
-        print(f"[-] Telegram Sync: {e}")
+        print(f"[-] Telegram Sync Notice: {e}")
     return state
 
-# --- SINGLE MODEL QUERY WITH AI DETECTION ---
-def query_gemini_model(model: str, prompt: str) -> dict:
-    """Query a single Gemini model and return result with metadata."""
+# --- GEMINI INFERENCE CALL WITH RETRY & FAILOVER ---
+def query_gemini_api(prompt: str):
     if not GEMINI_API_KEY:
-        return {"success": False, "model": model, "error": "GEMINI_API_KEY missing"}
+        print("[-] GEMINI_API_KEY missing.")
+        return None
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2}
     }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-    try:
-        res = requests.post(url, json=payload, timeout=30)
-        data = res.json()
-        
-        if res.status_code == 200:
-            candidates = data.get("candidates", [])
-            if candidates:
-                raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
-                
-                # Check for AI tells/traps
-                has_tells = contains_ai_tells(raw_text)
-                has_traps = contains_ai_traps(raw_text)
-                authenticity = ai_authenticity_score(raw_text)
-                
-                return {
-                    "success": True,
-                    "model": model,
-                    "raw_text": raw_text,
-                    "has_ai_tells": has_tells,
-                    "has_ai_traps": has_traps,
-                    "authenticity": authenticity,
-                    "error": None
-                }
-        elif res.status_code == 404:
-            return {"success": False, "model": model, "error": f"Model {model} not available (404)"}
-        else:
-            error_msg = data.get('error', {}).get('message', res.text)
-            return {"success": False, "model": model, "error": error_msg}
-            
-    except Exception as e:
-        return {"success": False, "model": model, "error": str(e)}
-
-# --- MODEL ENSEMBLE WITH CONSENSUS ---
-def query_gemini_ensemble(prompt: str) -> str:
-    """Query multiple models and use consensus-based filtering."""
-    results = []
-    successful_results = []
-    
-    print("[*] Querying model ensemble...")
-    
     for model in MODEL_CANDIDATES:
-        result = query_gemini_model(model, prompt)
-        results.append(result)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         
-        if result["success"]:
-            successful_results.append(result)
-            print(f"  ✓ {model}: Success (Authenticity: {result['authenticity']:.2f})")
-        else:
-            print(f"  ✗ {model}: {result['error']}")
-        
-        time.sleep(0.3)  # Brief delay between API calls
-    
-    if not successful_results:
-        print("[-] No successful model responses.")
-        return None
-    
-    # Filter out responses with AI tells/traps
-    authentic_results = [r for r in successful_results if r["authenticity"] > 0.5]
-    
-    if not authentic_results:
-        print("[-] All responses flagged as containing AI tells/traps. Rejecting ensemble.")
-        return None
-    
-    # Use highest authenticity score response as primary
-    best_result = max(authentic_results, key=lambda x: x["authenticity"])
-    
-    print(f"[+] Selected model: {best_result['model']} (Authenticity: {best_result['authenticity']:.2f})")
-    
-    return best_result["raw_text"]
+        # Try up to 2 times per model if high demand (503/429) occurs
+        for attempt in range(2):
+            try:
+                res = requests.post(url, json=payload, timeout=50)
+                data = res.json()
+
+                if res.status_code == 200:
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for part in parts:
+                            if "text" in part and not part.get("thought", False):
+                                return part["text"].strip()
+                        if parts:
+                            return parts[0].get("text", "").strip()
+
+                elif res.status_code in [429, 503]:
+                    print(f"[*] {model} high demand ({res.status_code}), waiting 2s...")
+                    time.sleep(2)
+                    continue
+                elif res.status_code == 404:
+                    break  # Endpoint not found, skip immediately to next model candidate
+                else:
+                    print(f"[-] {model} Error [{res.status_code}]: {data.get('error', {}).get('message', res.text)}")
+                    break
+            except requests.exceptions.Timeout:
+                print(f"[*] {model} request timed out (50s limit). Trying next candidate...")
+                break
+            except Exception as e:
+                print(f"[-] Request failed for {model}: {e}")
+                break
+
+    return None
 
 # --- PROCESS MICRO-TASK (<$100) ---
 def process_freelance_project(title: str, description: str):
+    title = html.unescape(title)
+    description = html.unescape(description)
     full_text = f"{title} {description}"
 
     if is_employment(full_text) or not is_tech_task(full_text):
@@ -255,55 +201,55 @@ def process_freelance_project(title: str, description: str):
     clean_desc = re.sub(r"\s+", " ", clean_desc)[:2500]
 
     prompt = f"""
-    You are an automated Python micro-task consultant.
-    Screen exclusively for SMALL, SHORT, ONE-OFF TECHNICAL TASKS (under $100 budget).
-    Examples: 1-page scrapers, single API integrations, simple Discord/Telegram bots, CSV data cleaning, or Python script fixes.
+    You are a direct, experienced freelance Python engineer applying to a small technical task.
+    
+    CRITICAL TONE RULES FOR PITCH (ANTI-AI DETECTION):
+    - NO greetings like "Dear Hiring Manager", "Hello client", or "I hope this finds you well".
+    - NEVER use AI buzzwords: "delve", "testament", "seamless", "thrilled", "excited", "spearhead", "cutting-edge", "look no further".
+    - Write exactly 2 natural, punchy sentences:
+      * Sentence 1: Name the exact library/method you will use and state that you can deliver it immediately.
+      * Sentence 2: State a flat rate between $25 and $85 and delivery within 4-12 hours.
+    
+    CRITICAL CODE RULES:
+    - Write clean, production-ready Python code.
+    - Include clean error handling.
 
     Project Title: {title}
     Project Details: {clean_desc}
 
-    Instructions:
-    1. Score from 0-100 on whether this is a quick, standalone, solvable micro-task.
-    2. Write a 2-sentence direct proposal stating the task can be delivered within 12-24 hours for a flat fee under $100.
-    3. Generate a complete, ready-to-run Python script prototype handling the task.
-
-    Return ONLY raw JSON (no markdown formatting, no code fences):
+    Return ONLY a single valid raw JSON object (no markdown formatting, no code fences):
     {{
         "fit_score": 85,
         "is_micro_task": true,
-        "task_name": "<Short 5-word deliverable name>",
-        "suggested_bid": "<e.g. $30 Flat Rate / $50 Flat Rate / $80 Flat Rate>",
-        "turnaround": "12-24 Hours",
-        "pitch": "<2-sentence direct pitch>",
-        "code": "<Complete Python prototype script>"
+        "task_name": "<5-word deliverable name>",
+        "suggested_bid": "<e.g. $35 Flat Rate / $50 Flat Rate>",
+        "turnaround": "4-12 Hours",
+        "pitch": "<2-sentence natural human pitch>",
+        "code": "<Complete runnable Python prototype>"
     }}
     """
 
-    raw_text = query_gemini_ensemble(prompt)
+    raw_text = query_gemini_api(prompt)
     if not raw_text:
         return None
 
-    try:
-        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text.strip())
-        clean_json = re.sub(r"\n?```$", "", clean_json.strip())
-        match = re.search(r"\{.*\}", clean_json, re.DOTALL)
-        result = json.loads(match.group(0)) if match else json.loads(clean_json)
-
-        if result.get("fit_score", 0) < MIN_TASK_SCORE or not result.get("is_micro_task", False):
-            print(f"[*] Filtered: '{title[:35]}...' (Score: {result.get('fit_score')})")
-            return None
-
-        return {
-            "score": result.get("fit_score", 0),
-            "task": result.get("task_name", title[:30]),
-            "bid": result.get("suggested_bid", "$45 Flat Rate"),
-            "turnaround": result.get("turnaround", "12-24h"),
-            "pitch": result.get("pitch", ""),
-            "code": sanitize_payload(result.get("code", ""))
-        }
-    except Exception as e:
-        print(f"[-] Processing Error for '{title[:30]}': {e}")
+    result = parse_json_safely(raw_text)
+    if not result:
+        print(f"[-] JSON extraction failed for '{title[:30]}'")
         return None
+
+    if result.get("fit_score", 0) < MIN_TASK_SCORE or not result.get("is_micro_task", False):
+        print(f"[*] Filtered: '{title[:35]}...' (Score: {result.get('fit_score')})")
+        return None
+
+    return {
+        "score": result.get("fit_score", 0),
+        "task": result.get("task_name", title[:30]),
+        "bid": result.get("suggested_bid", "$45 Flat Rate"),
+        "turnaround": result.get("turnaround", "4-12h"),
+        "pitch": result.get("pitch", ""),
+        "code": sanitize_payload(result.get("code", ""))
+    }
 
 # --- TELEGRAM DISPATCH ---
 def dispatch_task_alert(source, title, link, package, short_id):
@@ -314,7 +260,7 @@ def dispatch_task_alert(source, title, link, package, short_id):
         f"🎯 <b>Deliverable:</b> <code>{html.escape(str(package['task']))}</code>\n\n"
         f"💰 <b>Micro Bid:</b> {html.escape(str(package['bid']))}\n"
         f"⏱ <b>Turnaround:</b> {html.escape(str(package['turnaround']))}\n\n"
-        f"📝 <b>Direct Client Pitch:</b>\n"
+        f"💬 <b>Human-Style Direct Pitch:</b>\n"
         f"<code>{html.escape(str(package['pitch']))}</code>"
     )
 
@@ -350,7 +296,7 @@ def main():
     state = sync_telegram_actions(state)
 
     dispatched = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/14.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/17.0"}
 
     for source_name, feed_url in FEEDS.items():
         try:
