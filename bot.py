@@ -15,9 +15,9 @@ STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
 RETENTION_SECONDS = 86400  # Auto-purge entries older than 24 hours
 
-# --- SNIPER THRESHOLDS (PRESERVE YOUR LAST 5 BIDS) ---
+# --- SNIPER THRESHOLDS (MAX 1 DAY & MAX 5 BIDS) ---
 MAX_EXISTING_BIDS = 5          # Discard if more than 5 freelancers already bid
-MAX_PROJECT_AGE_MINUTES = 15   # Discard if posted more than 15 minutes ago
+MAX_PROJECT_AGE_MINUTES = 1440 # 24 hours (1 day) freshness window
 
 # --- HIGH-YIELD NICHE QUERIES (LOW BOT DENSITY) ---
 TARGET_QUERIES = [
@@ -304,13 +304,13 @@ def process_freelance_project(title: str, description: str):
     }
 
 # --- TELEGRAM DISPATCH WITH COMPETITION STATS ---
-def dispatch_task_alert(source, title, link, package, short_id, bid_count, age_mins):
+def dispatch_task_alert(source, title, link, package, short_id, bid_count, age_str):
     card = (
         f"⚡ <b>SNIPER BOUNTY [&lt;$100] [{package['score']}/100]</b>\n"
         f"🌐 <b>Source:</b> {html.escape(source)}\n"
         f"📌 <b>Project:</b> {html.escape(title)}\n"
         f"🎯 <b>Deliverable:</b> <code>{html.escape(str(package['task']))}</code>\n\n"
-        f"👥 <b>Competition:</b> {bid_count} existing bids | ⏱ <b>Posted:</b> {age_mins}m ago\n"
+        f"👥 <b>Competition:</b> {bid_count} existing bids | ⏱ <b>Posted:</b> {age_str}\n"
         f"💰 <b>Suggested Bid:</b> {html.escape(str(package['bid']))}\n"
         f"⏱ <b>Turnaround:</b> {html.escape(str(package['turnaround']))}\n\n"
         f"💬 <b>Human Pitch (Copy & Paste):</b>\n"
@@ -343,9 +343,17 @@ def dispatch_task_alert(source, title, link, package, short_id, bid_count, age_m
             "parse_mode": "HTML"
         }, timeout=10)
 
+# --- FORMAT AGE NICELY ---
+def format_age(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    rem_mins = minutes % 60
+    return f"{hours}h {rem_mins}m ago"
+
 # --- SCRAPER 1: FREELANCER API WITH SNIPER FILTERS ---
 def fetch_freelancer_api_projects():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperEngine/23.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperEngine/24.0"}
     collected = []
     now = time.time()
 
@@ -355,20 +363,20 @@ def fetch_freelancer_api_projects():
             res = requests.get(api_url, headers=headers, timeout=10).json()
             projects = res.get("result", {}).get("projects", [])
             for p in projects:
-                # 1. Proposal count check
+                # 1. Proposal count check (max 5)
                 bid_count = p.get("bid_stats", {}).get("bid_count")
                 if bid_count is None:
                     bid_count = p.get("bid_count", 0)
 
                 if bid_count > MAX_EXISTING_BIDS:
-                    continue  # Discard high-competition listings
+                    continue
 
-                # 2. Freshness check
+                # 2. Freshness check (max 1 day)
                 submit_time = p.get("submitdate") or p.get("time_submitted") or now
                 age_minutes = int((now - submit_time) / 60)
 
                 if age_minutes > MAX_PROJECT_AGE_MINUTES:
-                    continue  # Discard older listings
+                    continue
 
                 seo_url = p.get("seo_url", str(p.get("id")))
                 collected.append({
@@ -378,15 +386,15 @@ def fetch_freelancer_api_projects():
                     "link": f"https://www.freelancer.com/projects/{seo_url}",
                     "source": f"Freelancer ({query})",
                     "bid_count": bid_count,
-                    "age_mins": max(1, age_minutes)
+                    "age_str": format_age(max(1, age_minutes))
                 })
         except Exception as e:
             print(f"[-] API Error on '{query}': {e}")
     return collected
 
-# --- SCRAPER 2: EXTERNAL PUBLIC RSS FEEDS ---
+# --- SCRAPER 2: EXTERNAL RSS FEEDS ---
 def fetch_external_rss_feeds():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperFeedReader/23.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SniperFeedReader/24.0"}
     collected = []
 
     for source_name, feed_url in EXTERNAL_FEEDS.items():
@@ -402,7 +410,7 @@ def fetch_external_rss_feeds():
                     "link": entry.link,
                     "source": source_name,
                     "bid_count": 0,
-                    "age_mins": 5
+                    "age_str": "Recent"
                 })
         except Exception as e:
             print(f"[-] RSS Error on '{source_name}': {e}")
@@ -414,9 +422,9 @@ def main():
     state = sync_telegram_actions(state)
     dispatched = 0
 
-    print("[+] Running Sniper Scan (Max 5 Bids, Max 15 mins old)...")
+    print("[+] Running Scan (Max 5 Bids, Max 24 Hours old)...")
     fl_projects = fetch_freelancer_api_projects()
-    print(f"[+] Found {len(fl_projects)} fresh low-competition Freelancer tasks.")
+    print(f"[+] Found {len(fl_projects)} low-competition Freelancer tasks.")
 
     ext_projects = fetch_external_rss_feeds()
     all_listings = fl_projects + ext_projects
@@ -440,7 +448,7 @@ def main():
                     package,
                     short_id,
                     item.get("bid_count", 0),
-                    item.get("age_mins", 1)
+                    item.get("age_str", "Recent")
                 )
                 dispatched += 1
                 print(f" [✓] DISPATCHED: {item['title'][:35]}")
