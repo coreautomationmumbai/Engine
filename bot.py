@@ -5,24 +5,21 @@ import re
 import requests
 import feedparser
 
-# --- SECRETS & ENV ---
+# --- ENVIRONMENT VARIABLES ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_FILE = "seen_jobs.json"
-MIN_MATCH_SCORE = 65  # Filters out noise; only alerts on 65%+ matches
+MIN_SCORE = 65
 
-# --- EXPANDED HIGH-YIELD RSS FEEDS ---
 JOB_FEEDS = {
-    "WWR Programming": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-    "WWR DevOps/Sysadmin": "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
-    "WWR All Tech": "https://weworkremotely.com/categories/all-other-remote-jobs.rss",
-    "RemoteOK Tech": "https://remoteok.com/remote-jobs.rss",
-    "ProBlogger": "https://problogger.com/jobs/feed/"
+    "WWR Python/Backend": "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
+    "WWR Automation": "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+    "RemoteOK Tech": "https://remoteok.com/remote-jobs.rss"
 }
 
-# --- STATE MANAGEMENT ---
-def load_seen_jobs():
+# --- CACHE HELPERS ---
+def load_cache():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r") as f:
@@ -31,108 +28,140 @@ def load_seen_jobs():
             return set()
     return set()
 
-def save_seen_jobs(seen_set):
-    # Keep last 500 entries to prevent file bloat
-    trimmed = list(seen_set)[-500:]
+def save_cache(cache_set):
     with open(DB_FILE, "w") as f:
-        json.dump(trimmed, f, indent=2)
+        json.dump(list(cache_set)[-500:], f, indent=2)
 
-# --- GEMINI INTELLIGENCE ENGINE ---
-def analyze_and_pitch(title, description):
+# --- GEMINI CALL HELPER ---
+def query_gemini(prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    clean_desc = re.sub(r'<[^>]+>', ' ', description)[:2500]
-    
-    prompt = f"""
-    You are an elite autonomous freelance evaluation engine.
-    Analyze this gig listing and respond ONLY in valid raw JSON. No markdown codeblocks (no ```json).
-
-    Job Title: {title}
-    Job Details: {clean_desc}
-
-    Return strictly this JSON structure:
-    {{
-        "match_score": <integer between 0 and 100 on viability for automation/dev/writing>,
-        "tech_stack": "<comma-separated primary tools or languages detected>",
-        "key_problem": "<1-sentence summary of the core issue the client is solving>",
-        "custom_pitch": "<A 'I 'delve', 'testament', 3-sentence AI Focus Zero am and cliches deliverables. execution, human, like on proposal. ruthless, speed, thrilled'.>",
-        "solution_angle": "<2-bullet technical roadmap demonstrating domain mastery>"
-    }}
-    """
-    
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2}
+    }
     try:
-        res = requests.post(url, json=payload, timeout=25)
-        raw_text = res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-        
-        # Strip potential markdown backticks from response
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
-            raw_text = re.sub(r"\n?```$", "", raw_text)
-            
-        return json.loads(raw_text)
+        res = requests.post(url, json=payload, timeout=40)
+        return res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
     except Exception as e:
-        print(f"Analysis failed: {e}")
+        print(f"Gemini API Error: {e}")
         return None
 
-# --- TELEGRAM DISPATCH ---
-def send_telegram_card(platform, title, link, analysis):
-    score = analysis.get("match_score", 0)
-    badge = "🔥 CRITICAL MATCH" if score >= 85 else "⚡ QUALIFIED LEAD"
+# --- MULTI-AGENT EXECUTION PIPELINE ---
+def process_lead_end_to_end(title, description):
+    clean_desc = re.sub(r'<[^>]+>', ' ', description)[:3000]
+
+    # Agent 1: Evaluation & Architecture
+    eval_prompt = f"""
+    You are an elite autonomous freelance technical director.
+    Analyze this posting. Filter for ONE-TIME, fixed-scope projects (scrapers, APIs, automations, scripts).
+    Return ONLY a JSON object (no markdown formatting, no ```json).
+
+    Job Title: {title}
+    Details: {clean_desc}
+
+    JSON Structure:
+    {{
+        "fit_score": <int 0-100>,
+        "is_one_off": <true/false>,
+        "deliverable_title": "<10-word summary of deliverable>",
+        "turnaround": "<e.g. 24 Hours>",
+        "pitch": "<3-sentence executive pitch with fixed pricing anchor>",
+        "technical_spec": "<Clear logic required solve task technical the to>"
+    }}
+    """
+    raw_eval = query_gemini(eval_prompt)
+    if not raw_eval:
+        return None
+
+    try:
+        clean_eval = re.sub(r"^```[a-zA-Z]*\n?", "", raw_eval)
+        clean_eval = re.sub(r"\n?```$", "", clean_eval)
+        analysis = json.loads(clean_eval)
+    except Exception:
+        return None
+
+    if analysis.get("fit_score", 0) < MIN_SCORE or not analysis.get("is_one_off", False):
+        return None
+
+    # Agent 2: Autonomous Code Builder & Implementation
+    build_prompt = f"""
+    You are a Principal Software Engineer. Write a production-grade Python solution prototype for this client task.
     
-    msg = (
-        f"{badge} <b>[{score}/100]</b>\n"
+    Task: {analysis['deliverable_title']}
+    Technical Spec: {analysis['technical_spec']}
+
+    Requirements:
+    - Include full working logic, error handling, and clean code comments.
+    - Anonymize all author tags, system paths, and personal references.
+    - Provide concise implementation code only.
+    """
+    generated_code = query_gemini(build_prompt)
+    analysis["generated_code"] = generated_code or "# Prototype generation pending manual scope verification."
+
+    return analysis
+
+# --- TELEGRAM DISPATCH ---
+def send_telegram_package(platform, title, link, analysis):
+    score = analysis.get("fit_score", 0)
+    
+    # 1. Send the Executive Pitch Card
+    header_card = (
+        f"💎 <b>AUTONOMOUS LEAD [{score}/100]</b>\n"
         f"🌐 <b>Source:</b> {html.escape(platform)}\n"
         f"📌 <b>Role:</b> {html.escape(title)}\n"
-        f"🛠 <b>Stack:</b> <code>{html.escape(str(analysis.get('tech_stack', 'N/A')))}</code>\n\n"
-        f"🎯 <b>Core Need:</b>\n{html.escape(str(analysis.get('key_problem', 'N/A')))}\n\n"
-        f"📝 <b>Tailored Pitch:</b>\n<code>{html.escape(str(analysis.get('custom_pitch', '')))}</code>\n\n"
-        f"💡 <b>Execution Strategy:</b>\n{html.escape(str(analysis.get('solution_angle', '')))}"
+        f"🎯 <b>Asset:</b> <code>{html.escape(str(analysis.get('deliverable_title', 'N/A')))}</code>\n\n"
+        f"⏱ <b>Target Turnaround:</b> {html.escape(str(analysis.get('turnaround', 'N/A')))}\n\n"
+        f"📝 <b>Ready-to-Send Pitch:</b>\n"
+        f"<code>{html.escape(str(analysis.get('pitch', '')))}</code>"
     )
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    requests.post(url, json={
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg[:4000],
+        "text": header_card[:4000],
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "🚀 Open Direct Posting", "url": link}]
-            ]
+            "inline_keyboard": [[{"text": "⚡ Open Job Posting", "url": link}]]
         }
-    }
+    }, timeout=10)
+
+    # 2. Send the Generated Code Prototype as a Separate Message
+    code_text = analysis.get("generated_code", "")[:3900]
+    code_card = f"🛠 <b>Auto-Generated Prototype:</b>\n<pre><code class='language-python'>{html.escape(code_text)}</code></pre>"
     
-    requests.post(url, json=payload, timeout=10)
+    requests.post(url, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": code_card,
+        "parse_mode": "HTML"
+    }, timeout=10)
 
 # --- RUNNER ---
 def main():
-    seen_jobs = load_seen_jobs()
-    new_jobs_processed = 0
+    cache = load_cache()
+    dispatched = 0
 
     for platform, feed_url in JOB_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]: # Scan 5 most recent per feed
+            for entry in feed.entries[:6]:
                 job_id = getattr(entry, "id", entry.link)
-                
-                if job_id not in seen_jobs:
-                    seen_jobs.add(job_id)
+                if job_id not in cache:
+                    cache.add(job_id)
                     title = entry.title
                     link = entry.link
                     desc = getattr(entry, "summary", title)
-                    
-                    analysis = analyze_and_pitch(title, desc)
-                    if analysis and analysis.get("match_score", 0) >= MIN_MATCH_SCORE:
-                        send_telegram_card(platform, title, link, analysis)
-                        new_jobs_processed += 1
-                        
-        except Exception as e:
-            print(f"Error processing {platform}: {e}")
 
-    save_seen_jobs(seen_jobs)
-    print(f"Loop finished. Processed {new_jobs_processed} qualifying leads.")
+                    analysis = process_lead_end_to_end(title, desc)
+                    if analysis:
+                        send_telegram_package(platform, title, link, analysis)
+                        dispatched += 1
+        except Exception as e:
+            print(f"Error on {platform}: {e}")
+
+    save_cache(cache)
+    print(f"Loop finished. Sent {dispatched} ready-to-deliver assets.")
 
 if __name__ == "__main__":
     main()
