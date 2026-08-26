@@ -15,13 +15,13 @@ STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
 RETENTION_SECONDS = 86400  # Auto-purge entries older than 24 hours
 
-# --- TARGET MICRO-TASK FEEDS ---
+# --- TARGET MICRO-TASK FEEDS (FOCUSED ON PYTHON & AUTOMATION) ---
 FEEDS = {
-    "Freelancer.com Micro Projects": "https://www.freelancer.com/rss.xml",
-    "CryptoJobs Bounties": "https://cryptojobslist.com/rss/freelance",
-    "Remotive Tech Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
+    "Freelancer Python": "https://www.freelancer.com/rss/jobs/python.xml",
+    "Freelancer Web Scraping": "https://www.freelancer.com/rss/jobs/web-scraping.xml",
+    "Freelancer Data Mining": "https://www.freelancer.com/rss/jobs/data-mining.xml",
+    "Freelancer Automation": "https://www.freelancer.com/rss/jobs/software-architecture.xml"
 }
-
 # --- ACTIVE GEMINI MODELS (3.7 FLASH FIRST WITH FAILOVERS) ---
 MODEL_CANDIDATES = [
     "gemini-3.7-flash",
