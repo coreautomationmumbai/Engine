@@ -21,6 +21,13 @@ FEEDS = {
     "Remotive Tech Tasks": "https://remotive.com/remote-jobs/feed?category=software-development"
 }
 
+# --- ACTIVE FREE-TIER GEMINI MODELS (WITH INSTANT FALLBACK) ---
+MODEL_CANDIDATES = [
+    "gemini-3.6-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash"
+]
+
 # --- PRE-FILTER: REJECT EMPLOYMENT OR LARGE PROJECTS ---
 EMPLOYMENT_TERMS = [
     r"\bfull[\s-]?time\b", r"\bpart[\s-]?time\b", r"\bsalary\b", r"\bannual\b",
@@ -110,7 +117,39 @@ def sync_telegram_actions(state):
         print(f"[-] Telegram Sync: {e}")
     return state
 
-# --- GEMINI INFERENCE FOR MICRO-TASKS (<$100) ---
+# --- ROBUST GEMINI CALL WITH AUTO-FALLBACK ---
+def query_gemini_api(prompt: str):
+    if not GEMINI_API_KEY:
+        print("[-] GEMINI_API_KEY missing.")
+        return None
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2}
+    }
+
+    for model in MODEL_CANDIDATES:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            res = requests.post(url, json=payload, timeout=30)
+            data = res.json()
+            
+            if res.status_code == 200:
+                candidates = data.get("candidates", [])
+                if candidates:
+                    return candidates[0]["content"]["parts"][0]["text"].strip()
+            elif res.status_code == 404:
+                # Model not available in this tier/version, continue to next
+                continue
+            else:
+                print(f"[-] Gemini API [{model}] Error: {data.get('error', {}).get('message', res.text)}")
+        except Exception as e:
+            print(f"[-] Request failed for model {model}: {e}")
+            continue
+
+    return None
+
+# --- PROCESS MICRO-TASK (<$100) ---
 def process_freelance_project(title: str, description: str):
     full_text = f"{title} {description}"
 
@@ -122,18 +161,18 @@ def process_freelance_project(title: str, description: str):
 
     prompt = f"""
     You are an automated Python micro-task consultant.
-    Your goal is to screen exclusively for SMALL, SHORT, ONE-OFF TECHNICAL TASKS (under $100 budget).
-    Examples: 1-page scrapers, single API integrations, simple Discord/Telegram alert bots, data CSV cleaning, or fixing a specific Python script bug.
+    Screen exclusively for SMALL, SHORT, ONE-OFF TECHNICAL TASKS (under $100 budget).
+    Examples: 1-page scrapers, single API integrations, simple Discord/Telegram bots, CSV data cleaning, or Python script fixes.
 
     Project Title: {title}
     Project Details: {clean_desc}
 
     Instructions:
-    1. Score from 0-100 on whether this is a quick, standalone, solvable micro-task. Reject complex enterprise software or full-time jobs.
-    2. Write a 2-sentence direct, confident proposal stating the task can be delivered within 12-24 hours for a flat fee under $100.
+    1. Score from 0-100 on whether this is a quick, standalone, solvable micro-task.
+    2. Write a 2-sentence direct proposal stating the task can be delivered within 12-24 hours for a flat fee under $100.
     3. Generate a complete, ready-to-run Python script prototype handling the task.
 
-    Return ONLY raw JSON (no markdown fences, no ```json):
+    Return ONLY raw JSON (no markdown formatting, no code fences):
     {{
         "fit_score": 85,
         "is_micro_task": true,
@@ -145,22 +184,12 @@ def process_freelance_project(title: str, description: str):
     }}
     """
 
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2}
-    }
+    raw_text = query_gemini_api(prompt)
+    if not raw_text:
+        return None
 
     try:
-        res = requests.post(url, json=payload, timeout=40)
-        data = res.json()
-
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return None
-
-        raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
-        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
+        clean_json = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text.strip())
         clean_json = re.sub(r"\n?```$", "", clean_json.strip())
         match = re.search(r"\{.*\}", clean_json, re.DOTALL)
         result = json.loads(match.group(0)) if match else json.loads(clean_json)
@@ -172,7 +201,7 @@ def process_freelance_project(title: str, description: str):
         return {
             "score": result.get("fit_score", 0),
             "task": result.get("task_name", title[:30]),
-            "bid": result.get("suggested_bid", "$40 Flat Rate"),
+            "bid": result.get("suggested_bid", "$45 Flat Rate"),
             "turnaround": result.get("turnaround", "12-24h"),
             "pitch": result.get("pitch", ""),
             "code": sanitize_payload(result.get("code", ""))
@@ -194,7 +223,7 @@ def dispatch_task_alert(source, title, link, package, short_id):
         f"<code>{html.escape(str(package['pitch']))}</code>"
     )
 
-    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     requests.post(url, json={
         "chat_id": TELEGRAM_CHAT_ID,
@@ -226,7 +255,7 @@ def main():
     state = sync_telegram_actions(state)
 
     dispatched = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/12.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/14.0"}
 
     for source_name, feed_url in FEEDS.items():
         try:
