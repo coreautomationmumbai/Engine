@@ -15,14 +15,10 @@ STATE_FILE = "jobs_state.json"
 MIN_TASK_SCORE = 45
 RETENTION_SECONDS = 86400  # Auto-purge entries older than 24 hours
 
-# --- TARGET MICRO-TASK FEEDS (FOCUSED ON PYTHON & AUTOMATION) ---
-FEEDS = {
-    "Freelancer Python": "https://www.freelancer.com/rss/jobs/python.xml",
-    "Freelancer Web Scraping": "https://www.freelancer.com/rss/jobs/web-scraping.xml",
-    "Freelancer Data Mining": "https://www.freelancer.com/rss/jobs/data-mining.xml",
-    "Freelancer Automation": "https://www.freelancer.com/rss/jobs/software-architecture.xml"
-}
-# --- ACTIVE GEMINI MODELS (3.7 FLASH FIRST WITH FAILOVERS) ---
+# --- TARGET SEARCH QUERIES (FREELANCER PUBLIC API) ---
+TARGET_QUERIES = ["python", "web scraping", "data entry", "automation script"]
+
+# --- ACTIVE GEMINI MODELS ---
 MODEL_CANDIDATES = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
@@ -60,7 +56,7 @@ TECH_KEYWORDS = [
     r"\bscraping\b", r"\bbot\b", r"\bbots\b", r"\bdiscord\b", r"\btelegram\b",
     r"\bautomation\b", r"\bautomate\b", r"\bapi\b", r"\bwebhook\b", r"\bfix\b",
     r"\bcrawler\b", r"\bextract\b", r"\bcsv\b", r"\bparser\b", r"\btool\b",
-    r"\bselenium\b", r"\bplaywright\b", r"\bsql\b"
+    r"\bselenium\b", r"\bplaywright\b", r"\bsql\b", r"\bdata\b", r"\bexcel\b"
 ]
 
 def is_unwanted_task(text: str) -> bool:
@@ -131,7 +127,7 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(cleaned_state, f, indent=2)
 
-# --- TELEGRAM ACTIONS (AUTO-DISCARD & STATUS SYNC) ---
+# --- TELEGRAM ACTIONS ---
 def sync_telegram_actions(state):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
@@ -198,12 +194,10 @@ def query_gemini_api(prompt: str):
 
     for model in MODEL_CANDIDATES:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        
         for attempt in range(2):
             try:
                 res = requests.post(url, json=payload, timeout=50)
                 data = res.json()
-
                 if res.status_code == 200:
                     candidates = data.get("candidates", [])
                     if candidates:
@@ -213,17 +207,13 @@ def query_gemini_api(prompt: str):
                                 return part["text"].strip()
                         if parts:
                             return parts[0].get("text", "").strip()
-
                 elif res.status_code in [429, 503]:
                     time.sleep(2)
                     continue
-                elif res.status_code == 404:
-                    break
                 else:
                     break
             except Exception:
                 break
-
     return None
 
 # --- PROCESS MICRO-TASK (<$100) ---
@@ -278,11 +268,9 @@ def process_freelance_project(title: str, description: str):
 
     result = parse_json_safely(raw_text)
     if not result:
-        print(f"[-] JSON extraction failed for '{title[:30]}'")
         return None
 
     if result.get("fit_score", 0) < MIN_TASK_SCORE or not result.get("is_micro_task", False):
-        print(f"[*] Filtered out: '{title[:35]}...' (Score: {result.get('fit_score')})")
         return None
 
     return {
@@ -298,12 +286,12 @@ def process_freelance_project(title: str, description: str):
 def dispatch_task_alert(source, title, link, package, short_id):
     card = (
         f"⚡ <b>MICRO-TASK BOUNTY [&lt;$100] [{package['score']}/100]</b>\n"
-        f"🌐 <b>Platform:</b> {html.escape(source)}\n"
+        f"🌐 <b>Source:</b> {html.escape(source)}\n"
         f"📌 <b>Project:</b> {html.escape(title)}\n"
         f"🎯 <b>Deliverable:</b> <code>{html.escape(str(package['task']))}</code>\n\n"
-        f"💰 <b>Micro Bid:</b> {html.escape(str(package['bid']))}\n"
+        f"💰 <b>Suggested Bid:</b> {html.escape(str(package['bid']))}\n"
         f"⏱ <b>Turnaround:</b> {html.escape(str(package['turnaround']))}\n\n"
-        f"💬 <b>Human-Style Direct Pitch:</b>\n"
+        f"💬 <b>Human Pitch:</b>\n"
         f"<code>{html.escape(str(package['pitch']))}</code>"
     )
 
@@ -333,52 +321,62 @@ def dispatch_task_alert(source, title, link, package, short_id):
             "parse_mode": "HTML"
         }, timeout=10)
 
-# --- MAIN ENGINE LOOP ---
+# --- FETCH FROM FREELANCER PUBLIC API ---
+def fetch_freelancer_api_projects():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroEngine/20.0"}
+    collected_projects = []
+
+    for query in TARGET_QUERIES:
+        api_url = f"https://www.freelancer.com/api/projects/0.1/projects/active/?query={query}&sort_field=time_updated&reverse_sort=true&limit=15&compact=true&job_details=true"
+        try:
+            res = requests.get(api_url, headers=headers, timeout=10).json()
+            projects = res.get("result", {}).get("projects", [])
+            print(f"[+] API Query '{query}': {len(projects)} live projects retrieved.")
+            for p in projects:
+                seo_url = p.get("seo_url", str(p.get("id")))
+                link = f"https://www.freelancer.com/projects/{seo_url}"
+                collected_projects.append({
+                    "id": str(p.get("id")),
+                    "title": p.get("title", ""),
+                    "description": p.get("preview_description", p.get("description", "")),
+                    "link": link,
+                    "source": f"Freelancer ({query})"
+                })
+        except Exception as e:
+            print(f"[-] API Error for '{query}': {e}")
+    return collected_projects
+
+# --- MAIN EXECUTION ---
 def main():
     state = load_state()
     state = sync_telegram_actions(state)
-
     dispatched = 0
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MicroTaskEngine/19.0"}
 
-    for source_name, feed_url in FEEDS.items():
-        try:
-            req = requests.get(feed_url, headers=headers, timeout=10)
-            feed = feedparser.parse(req.content)
-            print(f"\n[+] Scanning {source_name}: {len(feed.entries)} listings found.")
+    projects = fetch_freelancer_api_projects()
 
-            for entry in feed.entries[:10]:
-                task_id = getattr(entry, "id", entry.link)
-                short_id = get_stable_id(task_id)
-
-                if short_id not in state:
-                    title = entry.title
-                    link = entry.link
-                    desc = getattr(entry, "summary", title)
-
-                    package = process_freelance_project(title, desc)
-                    if package:
-                        state[short_id] = {
-                            "title": title,
-                            "link": link,
-                            "status": "PENDING",
-                            "created_at": time.time(),
-                            "package": package
-                        }
-                        dispatch_task_alert(source_name, title, link, package, short_id)
-                        dispatched += 1
-                        print(f" [✓] DISPATCHED: {title[:35]}")
-                        time.sleep(0.5)
-
-        except Exception as e:
-            print(f"[-] Error on {source_name}: {e}")
+    for item in projects:
+        short_id = get_stable_id(item["id"])
+        if short_id not in state:
+            package = process_freelance_project(item["title"], item["description"])
+            if package:
+                state[short_id] = {
+                    "title": item["title"],
+                    "link": item["link"],
+                    "status": "PENDING",
+                    "created_at": time.time(),
+                    "package": package
+                }
+                dispatch_task_alert(item["source"], item["title"], item["link"], package, short_id)
+                dispatched += 1
+                print(f" [✓] DISPATCHED: {item['title'][:35]}")
+                time.sleep(0.5)
 
     pending_count = sum(1 for v in state.values() if v.get("status") == "PENDING")
     submitted_count = sum(1 for v in state.values() if v.get("status") == "SUBMITTED")
 
     save_state(state)
     print(f"\n==========================================")
-    print(f"Dispatched: {dispatched} micro-tasks (<$100).")
+    print(f"Dispatched: {dispatched} new micro-tasks.")
     print(f"Ledger Status: {pending_count} PENDING | {submitted_count} SUBMITTED")
     print(f"==========================================")
 
